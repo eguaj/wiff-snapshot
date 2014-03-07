@@ -1,0 +1,144 @@
+#!/bin/bash
+
+set -e
+
+function _usage {
+	cat <<EOF
+Usage:
+
+	$0 snapshot <wiff-root> <context-name> [<snapshot-output-file>]
+	$0 restore <wiff-root> <context-name> [<snapshot-input-file>]
+
+EOF
+}
+
+function _get_context_xml {
+	php /dev/stdin "$1" "$2" << 'EOF'
+<?php
+ini_set("error_log", null);
+$dom = new DOMDocument();
+$dom->formatOutput = true;
+if ($dom->load($argv[1]) === false) {
+	error_log(sprintf("Error loading file '%s'.", $argv[1]));
+	exit(1);
+}
+$xpath = new DOMXpath($dom);
+$contextList = $xpath->query('/contexts/context');
+foreach ($contextList as $context) {
+	if ($context->getAttribute('name') == $argv[2]) {
+		print $dom->saveXML($context);
+		exit(0);
+	}
+}
+error_log(sprintf("Could not find context with name '%s' in '%s'.", $argv[2], $argv[1]));
+exit(2);
+EOF
+}
+
+function _merge_context_xml {
+	php /dev/stdin "$1" "$2" "$3" << 'EOF'
+<?php
+ini_set("error_log", null);
+$dom = new DOMDocument();
+$dom->formatOutput = true;
+if ($dom->load($argv[1]) === false) {
+	error_log(sprintf("Error loading file '%s'.", $argv[1]));
+	exit(1);
+}
+$fragment = new DOMDocument();
+if ($fragment->load($argv[3]) === false) {
+	error_log(sprintf("Error loading file '%s'.", $argv[3]));
+	exit(2);
+}
+$xpath = new DOMXpath($dom);
+$contextList = $xpath->query('/contexts/context');
+foreach ($contextList as $context) {
+	if ($context->getAttribute('name') == $argv[2]) {
+		$dom->documentElement->removeChild($context);
+	}
+}
+$contextNode = $dom->importNode($fragment->documentElement, true);
+$dom->documentElement->appendChild($contextNode);
+print $dom->saveXML();
+exit(0);
+EOF
+}
+
+function _snapshot {
+	local WIFF_ROOT=$1
+	local CONTEXT_NAME=$2
+	local SNAPSHOT_FILE=$3
+
+	if [ -z "$WIFF_ROOT" ]; then
+		usage
+		return 1
+	fi
+	if [ -z "$CONTEXT_NAME" ]; then
+		usage
+		return 1
+	fi
+	if [ -z "$SNAPSHOT_FILE" ]; then
+		SNAPSHOT_FILE="-"
+	fi
+
+	local WORK=$(mktemp -d -t wiff-snapshot.XXXXXX)
+
+	"$WIFF_ROOT/wiff" context "$CONTEXT_NAME" exec /bin/bash -c 'touch maintenance.lock'
+	"$WIFF_ROOT/wiff" context "$CONTEXT_NAME" exec /bin/bash -c 'tar -C . -zcf - .' > "$WORK/context.tar.gz"
+	"$WIFF_ROOT/wiff" context "$CONTEXT_NAME" exec /bin/bash -c 'PGSERVICE="$pgservice_core" pg_dump | gzip' > "$WORK/db.pg_dump.gz"
+	_get_context_xml "$WIFF_ROOT/conf/contexts.xml" "$CONTEXT_NAME" > "$WORK/context.xml"
+	"$WIFF_ROOT/wiff" context "$CONTEXT_NAME" exec /bin/bash -c 'rm maintenance.lock'
+
+	tar -C "$WORK" -cf "$SNAPSHOT_FILE" context.xml context.tar.gz db.pg_dump.gz
+
+	rm -Rf "$WORK"
+
+	echo "Done: $SNAPSHOT_FILE" 1>&2
+}
+
+function _restore {
+	local WIFF_ROOT=$1
+	local CONTEXT_NAME=$2
+	local SNAPSHOT_FILE=$3
+
+	local WORK=$(mktemp -d -t wiff-snapshot.XXXXXX)
+
+	"$WIFF_ROOT/wiff" context "$CONTEXT_NAME" exec /bin/bash -c 'touch maintenance.lock'
+	"$WIFF_ROOT/wiff" context "$CONTEXT_NAME" exec /bin/bash -c 'find . -delete'
+	tar -xOf "$SNAPSHOT_FILE" "context.tar.gz" | "$WIFF_ROOT/wiff" context "$CONTEXT_NAME" exec /bin/bash -c 'tar zxf -'
+	"$WIFF_ROOT/wiff" context "$CONTEXT_NAME" exec /bin/bash << 'EOF'
+(
+PGSERVICE="$pgservice_core" psql -tA -c "SELECT 'DROP SCHEMA ' || pg_namespace.nspname || ' CASCADE;' FROM pg_namespace, pg_roles WHERE pg_namespace.nspowner = pg_roles.oid AND pg_roles.rolname = current_user"
+PGSERVICE="$pgservice_core" psql -tA -c "SELECT 'CREATE SCHEMA public;'"
+) | PGSERVICE="$pgservice_core" psql -a -f -
+EOF
+	(echo "SET synchronous_commit = off;"; tar -xOf "$SNAPSHOT_FILE" "db.pg_dump.gz" | gzip -dc) | "$WIFF_ROOT/wiff" context "$CONTEXT_NAME" exec /bin/bash -c 'PGSERVICE="$pgservice_core" psql -f -'
+	cp -p "$WIFF_ROOT/conf/contexts.xml" "$WORK/contexts.xml.new"
+	tar -C "$WORK" -xf "$SNAPSHOT_FILE" context.xml
+	_merge_context_xml "$WIFF_ROOT/conf/contexts.xml" "$CONTEXT_NAME" "$WORK/context.xml" > "$WORK/contexts.xml.new"
+	mv "$WORK/contexts.xml.new" "$WIFF_ROOT/conf/contexts.xml"
+
+	"$WIFF_ROOT/wiff" context "$CONTEXT_NAME" exec /bin/bash -c 'rm maintenance.lock'
+
+	rm -Rf "$WORK"
+
+	echo "Done: $SNAPSHOT_FILE" 1>&2
+}
+
+function _main {
+	case "$1" in
+		snapshot)
+			shift
+			_snapshot "$@"
+			;;
+		restore)
+			shift
+			_restore "$@"
+			;;
+		*)
+			_usage
+			;;
+	esac
+}
+
+_main "$@"
