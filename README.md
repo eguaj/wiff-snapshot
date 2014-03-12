@@ -1,11 +1,12 @@
 wiff-snapshot
 =============
 
-wiff-snapshot allows you to take "snapshots" of contexts and restore them.
+wiff-snapshot allows you to take "snapshots" of Dynacases' contexts and restore
+them.
 
 Snapshot contains:
-- contexts's files
-- database dump
+- context's files
+- database's dump
 - context's definition from dynacase-control
 
 Snapshot DOES NOT contains:
